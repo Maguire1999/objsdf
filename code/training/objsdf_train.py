@@ -132,7 +132,7 @@ class ObjSDFTrainRunner():
         self.checkpoint_freq = self.conf.get_int('train.checkpoint_freq', default=100)
         self.split_n_pixels = self.conf.get_int('train.split_n_pixels', default=10000)
         self.plot_conf = self.conf.get_config('plot')
-        self.n_sem = self.conf.get_int('model.implicit_network.d_out')
+        self.n_sem = self.conf.get_int('model.implicit_network.dout')
 
     def save_checkpoints(self, epoch):
         torch.save(
