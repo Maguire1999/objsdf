@@ -1,3 +1,6 @@
+import os
+
+import imageio
 import plotly.graph_objs as go
 import plotly.offline as offline
 from plotly.subplots import make_subplots
@@ -7,11 +10,151 @@ from skimage import measure
 import torchvision
 import trimesh
 from PIL import Image
+import lpips
+from skimage import metrics
 
 from utils import rend_util
-
+from utils.metrics import ConfusionMatrix, calculate_ap
 import matplotlib.pyplot as plt
 
+# data_dir = "/root/autodl-tmp/datasets/nerf_replica/replica_ins/office_3/"
+to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def seg_metric(gt_label_map,sem_label_map,sem_logit_map,img_res,num_semantic_class = 82):
+    try:
+        sem_logit_map = sem_logit_map.cpu().numpy()
+        gt_label_map = gt_label_map.cpu().numpy().reshape(-1, 1)
+        sem_label_map = sem_label_map.cpu().numpy().reshape(-1, 1)
+    except:
+        pass
+    H, W = img_res
+
+    val_cm = ConfusionMatrix(num_classes=num_semantic_class)
+    metric_iou = val_cm.add_batch(sem_label_map, gt_label_map, return_miou=True)
+
+    '''mAP'''
+    confusion_matrix = val_cm.confusion_matrix
+
+    unique_pred_labels = np.unique(sem_label_map)
+    unique_gt_labels = np.unique(gt_label_map)
+    num_valid_labels = len(unique_gt_labels)
+    siou = np.divide(np.diag(confusion_matrix), (np.sum(confusion_matrix, axis=1) + np.sum(confusion_matrix, axis=0)
+                                                 - np.diag(confusion_matrix) + 1e-6))
+    iou_metrics = siou[unique_gt_labels]
+
+    '''confidence values'''
+    # prepare confidence values
+    unique_pred_labels, unique_gt_labels = torch.from_numpy(unique_pred_labels), torch.from_numpy(unique_gt_labels)
+    pred_label_map = torch.from_numpy(sem_label_map).reshape(H, W)
+    pred_conf_mask = torch.from_numpy(sem_logit_map).reshape(H, W, num_semantic_class)
+    conf_scores = torch.zeros_like(unique_gt_labels, dtype=torch.float32)
+    for i, label in enumerate(unique_gt_labels):
+        if label.item() in unique_pred_labels:
+            index = torch.where(pred_label_map == label)
+            ssm = pred_conf_mask[index[0], index[1]]  # confidence value
+            pred_obj_conf = torch.median(ssm).item()  # median confidence value for one object
+            conf_scores[i] = pred_obj_conf
+
+    iou_metrics = torch.from_numpy(iou_metrics).to(device)
+    conf_scores = conf_scores.to(device)
+
+    thre_list = [0.5, 0.75]
+    ap = calculate_ap(iou_metrics, num_valid_labels, thre_list, device, confidence=conf_scores,
+                      function_select='integral')
+    return ap,metric_iou
+    # '''mIoU'''
+    # metric_ious.append(metric_iou)
+    #
+    # all_ap.append(ap)
+
+    # miou = np.mean(np.array(metric_ious))
+    #
+    # all_ap = np.array(all_ap)
+    # mean_ap = np.mean(all_ap, axis=0)
+    #
+    #
+    # sem_label_maps = np.stack(sem_label_maps, 0)
+    # sem_label_maps_flatten = sem_label_maps.reshape(-1, 1)
+    # gt_label_maps_flatten = gt_label_maps[0::img_eval_interval].reshape(-1, 1)
+    # metric_iou_pix = val_cm_pix.add_batch(sem_label_maps_flatten, gt_label_maps_flatten, return_miou=True)
+    # # metric_ious.append(metric_iou_pix)
+
+def render_label2img(labels, ins_map):
+    unique_labels = torch.unique(labels)
+    labels = labels.cpu()
+    unique_labels = unique_labels.cpu()
+    h, w = labels.shape
+    ra_se_im_t = np.zeros(shape=(h, w, 3))
+    for index, label in enumerate(unique_labels):
+        ra_se_im_t[labels == label] = ins_map[label]
+    ra_se_im_t = ra_se_im_t.astype(np.uint8)
+    return ra_se_im_t
+
+def metric_test(index,plot_data,img_res):
+    H, W = img_res
+    rgb = plot_data['rgb_eval'].reshape([H, W, 3])
+    gt_imgs = plot_data['rgb_gt'].reshape([H, W, 3])
+
+    # rgb = lin2img(plot_data['rgb_eval'], img_res)
+    # gt_imgs = lin2img(plot_data['rgb_gt'], img_res)
+    lpips_vgg = lpips.LPIPS(net="vgg").to("cuda")
+    # rgb.shape HW3
+    # rgb image evaluation part
+    psnr = metrics.peak_signal_noise_ratio(rgb.cpu().numpy(), gt_imgs.cpu().numpy(), data_range=1)
+    ssim = metrics.structural_similarity(rgb.cpu().numpy(), gt_imgs.cpu().numpy(), multichannel=True, data_range=1,
+                                         win_size=7, channel_axis=-1)
+    # ssim = metrics.structural_similarity(rgb.cpu().numpy(), gt_imgs.cpu().numpy(), multichannel=True, data_range=1)
+    # ssim = metrics.structural_similarity(rgb.permute(2, 0, 1).unsqueeze(0).cpu().numpy(), gt_imgs.permute(2, 0, 1).unsqueeze(0).cpu().numpy(), multichannel=True, data_range=1)
+    lpips_i = lpips_vgg(rgb.permute(2, 0, 1).unsqueeze(0).to("cuda"), gt_imgs.permute(2, 0, 1).unsqueeze(0).to("cuda"))
+    # psnrs.append(psnr)
+    # ssims.append(ssim)
+    # lpipses.append(lpips_i.item())
+    print(f"index{index} PSNR: {psnr} SSIM: {ssim} LPIPS: {lpips_i.item()}")
+    return psnr,ssim,lpips_i
+
+
+def plot_test(implicit_network, indices, plot_data, path, index, img_res, plot_nimgs, resolution, grid_boundary, level=0,ins_map = None):
+
+    if plot_data is not None:
+        save_path = os.path.join(path, 'test')
+        os.makedirs(save_path, exist_ok=True)
+
+        H, W = img_res
+
+        rgb = plot_data['rgb_eval'].reshape([H, W, 3])
+        rgb8 = to8b(rgb.cpu().numpy())
+        filename = os.path.join(save_path, '{:03d}.png'.format(index))
+        imageio.imwrite(filename, rgb8)
+
+        # plot semantic_image
+        if 'semantic_map' in plot_data.keys():
+
+            gt_label = plot_data['seg_gt'].reshape([H, W]).long()
+            gt_ins_img = render_label2img(gt_label, ins_map)
+            gt_img_file = os.path.join(save_path, f'{index}_ins_gt.png')
+            imageio.imwrite(gt_img_file, gt_ins_img)
+            gt_ins_file = os.path.join(save_path, f'{index}_ins_gt_mask.png')
+            imageio.imwrite(gt_ins_file, np.array(gt_label.cpu().numpy(), dtype=np.uint8))
+
+            pred_label = plot_data['semantic_map'].reshape([H, W]).long()
+            ins_img = render_label2img(pred_label,ins_map)
+            pred_ins_file = os.path.join(save_path, f'{index}_ins_pred_mask.png')
+            fileins = os.path.join(save_path, f"instance_{str(index).zfill(3)}.png")
+            imageio.imwrite(pred_ins_file, np.array(pred_label.cpu().numpy(), dtype=np.uint8))
+            imageio.imwrite(fileins, ins_img)
+
+
+
+        # plot_seg_images(plot_data['semantic_map'], plot_data['seg_gt'], path, index, plot_nimgs, img_res)
+        # plot_images(plot_data['rgb_eval'], plot_data['rgb_gt'], path, index, plot_nimgs, img_res)
+        #
+        # plot normal maps
+        plot_normal_maps(plot_data['normal_map'], save_path, index, plot_nimgs, img_res)
+    psnr,ssim,lpips_i = metric_test(index, plot_data, img_res)
+    pred_logit = plot_data['semantic_logit_map'].reshape([H, W,plot_data['semantic_logit_map'].shape[-1]])
+    ap,iou = seg_metric(gt_label, pred_label, pred_logit, img_res, num_semantic_class=plot_data['num_class'])
+    return psnr,ssim,lpips_i,ap,iou
 
 def plot(implicit_network, indices, plot_data, path, epoch, img_res, plot_nimgs, resolution, grid_boundary, level=0):
 
@@ -141,13 +284,23 @@ def get_semantic_surface_trace(path, epoch, sdf, resolution=100, grid_boundary=[
 
         z = z.astype(np.float32)
 
-        verts, faces, normals, values = measure.marching_cubes(
-            volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
-                             grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
-            level=level,
-            spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
-                     grid['xyz'][0][2] - grid['xyz'][0][1],
-                     grid['xyz'][0][2] - grid['xyz'][0][1]))
+        try:
+            verts, faces, normals, values = measure.marching_cubes_lewiner(
+                volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
+                                 grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
+                level=level,
+                spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1]),
+                allow_degenerate=True)
+        except:
+            verts, faces, normals, values = measure.marching_cubes(
+                volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
+                                 grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
+                level=level,
+                spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1]))
 
         verts = verts + np.array([grid['xyz'][0][0], grid['xyz'][1][0], grid['xyz'][2][0]])
 
@@ -179,14 +332,22 @@ def get_surface_trace(path, epoch, sdf, resolution=100, grid_boundary=[-2.0, 2.0
     if (not (np.min(z) > level or np.max(z) < level)):
 
         z = z.astype(np.float32)
-
-        verts, faces, normals, values = measure.marching_cubes(
-            volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
-                             grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
-            level=level,
-            spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
-                     grid['xyz'][0][2] - grid['xyz'][0][1],
-                     grid['xyz'][0][2] - grid['xyz'][0][1]))
+        try:
+            verts, faces, normals, values = measure.marching_cubes_lewiner(
+                volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
+                                 grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
+                level=level,
+                spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1]))
+        except:
+            verts, faces, normals, values = measure.marching_cubes(
+                volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
+                                 grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
+                level=level,
+                spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1]))
 
         verts = verts + np.array([grid['xyz'][0][0], grid['xyz'][1][0], grid['xyz'][2][0]])
 
@@ -217,15 +378,22 @@ def get_surface_high_res_mesh(sdf, resolution=100, grid_boundary=[-2.0, 2.0], le
     z = np.concatenate(z, axis=0)
 
     z = z.astype(np.float32)
-
-    verts, faces, normals, values = measure.marching_cubes(
-        volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
-                         grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
-        level=level,
-        spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
-                 grid['xyz'][0][2] - grid['xyz'][0][1],
-                 grid['xyz'][0][2] - grid['xyz'][0][1]))
-
+    try:
+        verts, faces, normals, values = measure.marching_cubes_lewiner(
+            volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
+                             grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
+            level=level,
+            spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
+                     grid['xyz'][0][2] - grid['xyz'][0][1],
+                     grid['xyz'][0][2] - grid['xyz'][0][1]))
+    except:
+        verts, faces, normals, values = measure.marching_cubes(
+            volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
+                             grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
+            level=level,
+            spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
+                     grid['xyz'][0][2] - grid['xyz'][0][1],
+                     grid['xyz'][0][2] - grid['xyz'][0][1]))
     verts = verts + np.array([grid['xyz'][0][0], grid['xyz'][1][0], grid['xyz'][2][0]])
 
     mesh_low_res = trimesh.Trimesh(verts, faces, normals)
@@ -268,15 +436,22 @@ def get_surface_high_res_mesh(sdf, resolution=100, grid_boundary=[-2.0, 2.0], le
     if (not (np.min(z) > level or np.max(z) < level)):
 
         z = z.astype(np.float32)
-
-        verts, faces, normals, values = measure.marching_cubes(
-            volume=z.reshape(grid_aligned['xyz'][1].shape[0], grid_aligned['xyz'][0].shape[0],
-                             grid_aligned['xyz'][2].shape[0]).transpose([1, 0, 2]),
-            level=level,
-            spacing=(grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
-                     grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
-                     grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1]))
-
+        try:
+            verts, faces, normals, values = measure.marching_cubes_lewiner(
+                volume=z.reshape(grid_aligned['xyz'][1].shape[0], grid_aligned['xyz'][0].shape[0],
+                                 grid_aligned['xyz'][2].shape[0]).transpose([1, 0, 2]),
+                level=level,
+                spacing=(grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
+                         grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
+                         grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1]))
+        except:
+            verts, faces, normals, values = measure.marching_cubes(
+                volume=z.reshape(grid_aligned['xyz'][1].shape[0], grid_aligned['xyz'][0].shape[0],
+                                 grid_aligned['xyz'][2].shape[0]).transpose([1, 0, 2]),
+                level=level,
+                spacing=(grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
+                         grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
+                         grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1]))
         verts = torch.from_numpy(verts).cuda().float()
         verts = torch.bmm(vecs.unsqueeze(0).repeat(verts.shape[0], 1, 1).transpose(1, 2),
                    verts.unsqueeze(-1)).squeeze()
@@ -305,15 +480,22 @@ def get_surface_by_grid(grid_params, sdf, resolution=100, level=0, higher_res=Fa
         z = np.concatenate(z, axis=0)
 
         z = z.astype(np.float32)
-
-        verts, faces, normals, values = measure.marching_cubes(
-            volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
-                             grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
-            level=level,
-            spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
-                     grid['xyz'][0][2] - grid['xyz'][0][1],
-                     grid['xyz'][0][2] - grid['xyz'][0][1]))
-
+        try:
+            verts, faces, normals, values = measure.marching_cubes_lewiner(
+                volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
+                                 grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
+                level=level,
+                spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1]))
+        except:
+            verts, faces, normals, values = measure.marching_cubes(
+                volume=z.reshape(grid['xyz'][1].shape[0], grid['xyz'][0].shape[0],
+                                 grid['xyz'][2].shape[0]).transpose([1, 0, 2]),
+                level=level,
+                spacing=(grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1],
+                         grid['xyz'][0][2] - grid['xyz'][0][1]))
         verts = verts + np.array([grid['xyz'][0][0], grid['xyz'][1][0], grid['xyz'][2][0]])
 
         mesh_low_res = trimesh.Trimesh(verts, faces, normals)
@@ -358,15 +540,22 @@ def get_surface_by_grid(grid_params, sdf, resolution=100, level=0, higher_res=Fa
     if (not (np.min(z) > level or np.max(z) < level)):
 
         z = z.astype(np.float32)
-
-        verts, faces, normals, values = measure.marching_cubes(
-            volume=z.reshape(grid_aligned['xyz'][1].shape[0], grid_aligned['xyz'][0].shape[0],
-                             grid_aligned['xyz'][2].shape[0]).transpose([1, 0, 2]),
-            level=level,
-            spacing=(grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
-                     grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
-                     grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1]))
-
+        try:
+            verts, faces, normals, values = measure.marching_cubes_lewiner(
+                volume=z.reshape(grid_aligned['xyz'][1].shape[0], grid_aligned['xyz'][0].shape[0],
+                                 grid_aligned['xyz'][2].shape[0]).transpose([1, 0, 2]),
+                level=level,
+                spacing=(grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
+                         grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
+                         grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1]))
+        except:
+            verts, faces, normals, values = measure.marching_cubes(
+                volume=z.reshape(grid_aligned['xyz'][1].shape[0], grid_aligned['xyz'][0].shape[0],
+                                 grid_aligned['xyz'][2].shape[0]).transpose([1, 0, 2]),
+                level=level,
+                spacing=(grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
+                         grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1],
+                         grid_aligned['xyz'][0][2] - grid_aligned['xyz'][0][1]))
         if higher_res:
             verts = torch.from_numpy(verts).cuda().float()
             verts = torch.bmm(vecs.unsqueeze(0).repeat(verts.shape[0], 1, 1).transpose(1, 2),
