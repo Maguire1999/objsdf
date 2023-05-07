@@ -63,7 +63,7 @@ class ObjSDFLoss(nn.Module):
         # semantic_loss = self.semantic_loss(semantic_value, semantic_gt)
         return semantic_loss
 
-    def forward(self, model_outputs, ground_truth):
+    def forward(self, model_outputs, ground_truth, seg_flag = True):
         rgb_gt = ground_truth['rgb'].cuda()
 
         rgb_loss = self.get_rgb_loss(model_outputs['rgb_values'], rgb_gt)
@@ -72,7 +72,7 @@ class ObjSDFLoss(nn.Module):
         else:
             eikonal_loss = torch.tensor(0.0).cuda().float()
 
-        if 'semantic_values' in model_outputs:
+        if 'semantic_values' in model_outputs and seg_flag:
             semantic_gt = ground_truth['segs'].cuda().long()
             semantic_loss = self.get_semantic_loss(model_outputs['semantic_values'], semantic_gt)
         else:

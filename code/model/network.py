@@ -1,6 +1,6 @@
 import torch.nn as nn
 import numpy as np
-
+import torch
 from utils import rend_util
 from model.embedder import *
 from model.density import Density, LaplaceDensity
@@ -12,7 +12,7 @@ class ImplicitNetwork(nn.Module):
             feature_vector_size,
             sdf_bounding_sphere,
             d_in,
-            d_out,
+            dout,
             dims,
             geometric_init=True,
             bias=1.0,
@@ -25,7 +25,7 @@ class ImplicitNetwork(nn.Module):
 
         self.sdf_bounding_sphere = sdf_bounding_sphere
         self.sphere_scale = sphere_scale
-        dims = [d_in] + dims + [d_out + feature_vector_size]
+        dims = [d_in] + dims + [dout + feature_vector_size]
 
         self.embed_fn = None
         if multires > 0:
@@ -134,7 +134,7 @@ class RenderingNetwork(nn.Module):
             feature_vector_size,
             mode,
             d_in,
-            d_out,
+            dout,
             dims,
             weight_norm=True,
             multires_view=0,
@@ -142,7 +142,7 @@ class RenderingNetwork(nn.Module):
         super().__init__()
 
         self.mode = mode
-        dims = [d_in + feature_vector_size] + dims + [d_out]
+        dims = [d_in + feature_vector_size] + dims + [dout]
 
         self.embedview_fn = None
         if multires_view > 0:
@@ -288,7 +288,7 @@ class SemImplicitNetwork(nn.Module):
             feature_vector_size,
             sdf_bounding_sphere,
             d_in,
-            d_out,
+            dout,
             dims,
             geometric_init=True,
             bias=1.0,
@@ -302,7 +302,7 @@ class SemImplicitNetwork(nn.Module):
 
         self.sdf_bounding_sphere = sdf_bounding_sphere
         self.sphere_scale = sphere_scale
-        dims = [d_in] + dims + [d_out + feature_vector_size]
+        dims = [d_in] + dims + [dout + feature_vector_size]
 
         self.embed_fn = None
         if multires > 0:
@@ -312,7 +312,7 @@ class SemImplicitNetwork(nn.Module):
 
         self.num_layers = len(dims)
         self.skip_in = skip_in
-        self.d_out = d_out
+        self.d_out = dout
         self.sigmoid = sigmoid
 
         for l in range(0, self.num_layers - 1):
@@ -482,7 +482,7 @@ class SemVolSDFNetwork(nn.Module):
         self.density = LaplaceDensity(**conf.get_config('density'))
         self.ray_sampler = ErrorBoundSampler(self.scene_bounding_sphere, **conf.get_config('ray_sampler'))
 
-        self.num_semantic = conf.get_int('implicit_network.d_out')
+        self.num_semantic = conf.get_int('implicit_network.dout')
     def forward(self, input):
         # Parse model input
         intrinsics = input["intrinsics"]
@@ -646,7 +646,7 @@ class SemImplicitNetwork_V2(nn.Module):
             feature_vector_size,
             sdf_bounding_sphere,
             d_in,
-            d_out,
+            dout,
             dims,
             geometric_init=True,
             bias=1.0,
@@ -662,7 +662,7 @@ class SemImplicitNetwork_V2(nn.Module):
 
         self.sdf_bounding_sphere = sdf_bounding_sphere
         self.sphere_scale = sphere_scale
-        dims = [d_in] + dims + [d_out + 1 + feature_vector_size] # 1 for sdf
+        dims = [d_in] + dims + [dout + 1 + feature_vector_size] # 1 for sdf
 
         self.embed_fn = None
         if multires > 0:
@@ -672,7 +672,7 @@ class SemImplicitNetwork_V2(nn.Module):
 
         self.num_layers = len(dims)
         self.skip_in = skip_in
-        self.d_out = d_out
+        self.d_out = dout
 
         for l in range(0, self.num_layers - 1):
             if l + 1 in self.skip_in:

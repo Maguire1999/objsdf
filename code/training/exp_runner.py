@@ -1,6 +1,6 @@
 from re import T
 import sys
-
+import torch
 sys.path.append('../code')
 import argparse
 import GPUtil
@@ -10,9 +10,10 @@ from training.objsdf_train import ObjSDFTrainRunner
 
 if __name__ == '__main__':
 
+    torch.set_default_tensor_type('torch.FloatTensor')
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch_size', type=int, default=1, help='input batch size')
-    parser.add_argument('--nepoch', type=int, default=10000, help='number of epochs to train for')
+    parser.add_argument('--nepoch', type=int, default=800, help='number of epochs to train for')
     parser.add_argument('--conf', type=str, default='./confs/dtu.conf')
     parser.add_argument('--expname', type=str, default='')
     parser.add_argument("--exps_folder", type=str, default="exps")
@@ -31,6 +32,10 @@ if __name__ == '__main__':
     parser.add_argument('--finetune_file', type=str, default=None, help='the file contain the layers which gonna be finetuned.')
     parser.add_argument('--vis_seprate', default=False, action="store_true",
                         help='run rendering for each semantic label, only use if sdf is for each object')
+
+    parser.add_argument('--sparse_inv', type=int, default=1, help='sparse inv ')
+    parser.add_argument('--render_test', default=False, action="store_true",
+                        help='render test data')
 
     opt = parser.parse_args()
 
@@ -68,9 +73,13 @@ if __name__ == '__main__':
                                     checkpoint=opt.checkpoint,
                                     do_vis=not opt.cancel_vis,
                                     finetune_folder = opt.finetune_folder,
-                                    finetune_file = opt.finetune_file
+                                    finetune_file = opt.finetune_file,
+                                    sparse_inv = opt.sparse_inv
                                     )
     else:
         raise ValueError('opt.train_type {} is not implemented'.format(opt.train_type))
-
-    trainrunner.run()
+    if opt.render_test:
+        trainrunner.test()
+    else:
+        trainrunner.run()
+        trainrunner.test()

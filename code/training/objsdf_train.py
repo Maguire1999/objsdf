@@ -4,7 +4,7 @@ from pyhocon import ConfigFactory
 import sys
 import torch
 from tqdm import tqdm
-
+import numpy as np
 import utils.general as utils
 import utils.plots as plt
 from utils import rend_util
@@ -72,8 +72,18 @@ class ObjSDFTrainRunner():
         self.all_dataset = utils.get_class(self.conf.get_string('train.dataset_class'))(**dataset_conf)
         self.train_dataset = torch.utils.data.Subset(self.all_dataset, self.all_dataset.i_split[0])
         self.test_dataset = torch.utils.data.Subset(self.all_dataset, self.all_dataset.i_split[1])
-
+        # if self.conf.get_string('train.dataset_class') == 'datasets.replica_dmnerf_dataset.ReplicaDatasetDMNeRF':
+        #     self.train_dataset = utils.get_class(self.conf.get_string('train.dataset_class'))(**dataset_conf)
+        #     self.all_dataset = self.train_dataset
+        #     dataset_conf['split'] = 'test'
+        #     self.test_dataset = utils.get_class(self.conf.get_string('train.dataset_class'))(**dataset_conf)
+        # else:
+        #     self.all_dataset = utils.get_class(self.conf.get_string('train.dataset_class'))(**dataset_conf)
+        #     self.train_dataset = torch.utils.data.Subset(self.all_dataset, self.all_dataset.i_split[0])
+        #     self.test_dataset = torch.utils.data.Subset(self.all_dataset, self.all_dataset.i_split[1])
+        self.sparse_inv = kwargs['sparse_inv']
         self.ds_len = len(self.train_dataset)
+        self.train_sparse_list = list(range(self.ds_len))[::kwargs['sparse_inv']]
         print('Finish loading data. Data-set size: {0}'.format(self.ds_len))
 
         self.train_dataloader = torch.utils.data.DataLoader(self.train_dataset,
@@ -205,9 +215,22 @@ class ObjSDFTrainRunner():
                 model_input["intrinsics"] = model_input["intrinsics"].cuda()
                 model_input["uv"] = model_input["uv"].cuda()
                 model_input['pose'] = model_input['pose'].cuda()
+                try:
+                    model_outputs = self.model(model_input)
+                except:
+                    split = utils.split_input(model_input, self.total_pixels, n_pixels=self.split_n_pixels)
+                    res = []
+                    for s in tqdm(split):
+                        out = self.model(s)
+                        d = {'rgb_values': out['rgb_values'],
+                             'normal_map': out['normal_map'],
+                             'semantic_map': out['semantic_values']}
+                        res.append(d)
+                    batch_size = ground_truth['rgb'].shape[0]
+                    model_outputs = utils.merge_output(res, self.total_pixels, batch_size)
 
-                model_outputs = self.model(model_input)
-                loss_output = self.loss(model_outputs, ground_truth)
+                seg_flag = data_index in self.train_sparse_list
+                loss_output = self.loss(model_outputs, ground_truth,seg_flag = seg_flag)
 
                 loss = loss_output['loss']
 
@@ -230,6 +253,91 @@ class ObjSDFTrainRunner():
                 self.scheduler.step()
 
         self.save_checkpoints(epoch)
+
+    # @torch.no_grad()
+    def test(self):
+        self.model.eval()
+        self.all_dataset.change_sampling_idx(-1)
+        # self.all_dataset.change_sampling_idx(self.num_pixels)
+
+        psnrs = []
+        ssims = []
+        lpipses = []
+        metric_ious = []
+        all_ap = []
+        # with torch.no_grad():
+        for data_index, (indices, model_input, ground_truth) in enumerate(self.plot_dataloader):
+            model_input["intrinsics"] = model_input["intrinsics"].cuda()
+            model_input["uv"] = model_input["uv"].cuda()
+            model_input['pose'] = model_input['pose'].cuda()
+
+            split = utils.split_input(model_input, self.total_pixels, n_pixels=self.split_n_pixels)
+            res = []
+            for s in tqdm(split):
+                out = self.model(s)
+                d = {'rgb_values': out['rgb_values'].detach(),
+                     'normal_map': out['normal_map'].detach(),
+                     'semantic_map': out['semantic_values'].detach()}
+                res.append(d)
+
+            batch_size = ground_truth['rgb'].shape[0]
+            model_outputs = utils.merge_output(res, self.total_pixels, batch_size)
+
+            plot_data = self.get_plot_data(model_outputs, model_input['pose'], ground_truth['rgb'],
+                                           ground_truth['segs'])
+            plot_data['num_class'] = self.conf.get_config('model').implicit_network.dout
+            plot_data['semantic_logit_map'] = model_outputs['semantic_map']
+
+
+            psnr,ssim,lpips_i,ap,iou = plt.plot_test(self.model.implicit_network,
+                                                    indices,
+                                                    plot_data,
+                                                    self.plots_dir,
+                                                    data_index,
+                                                    self.img_res,
+                                                      self.plot_conf.plot_nimgs,
+                                                      self.plot_conf.resolution,
+                                                      self.plot_conf.grid_boundary,
+                                                      ins_map=self.all_dataset.ins_rgbs
+                                              )
+            # if data_index > 0:
+            #     break
+            psnrs.append(psnr)
+            ssims.append(ssim)
+            lpipses.append(lpips_i.item())
+            # '''mIoU'''
+            metric_ious.append(iou)
+            #
+            all_ap.append(ap)
+
+        miou = np.mean(np.array(metric_ious))
+
+        all_ap = np.array(all_ap)
+        mean_ap = np.mean(all_ap, axis=0)
+
+        print('PSNR: {:.4f}, SSIM: {:.4f},  LPIPS: {:.4f} '.format(np.mean(psnrs), np.mean(ssims), np.mean(lpipses)))
+        save_path = os.path.join(self.plots_dir, 'test')
+        # os.makedirs(save_path, exist_ok=True)
+        test_result_file = os.path.join(save_path, 'test_results.txt')
+        ins_metrics_file = os.path.join(save_path, 'ins_metrics.txt')
+        mean_output = np.array([np.mean(psnrs), np.mean(ssims), np.mean(lpipses)])
+        np.savetxt(fname=test_result_file, X=mean_output, fmt='%.6f', delimiter=' ')
+
+        """ save seg res"""
+        sparse_ratio = 1 - 1 / self.sparse_inv
+        ins_metric_desc = f'sparsity_ratio = {sparse_ratio * 100}%, mIoU = {miou}, '
+        thre_list = [0.5, 0.75]
+        for i, thre in enumerate(thre_list):
+            ins_metric_desc += f'mAP@{thre} = {mean_ap[i]}, '
+        print(ins_metric_desc)
+        # ins_metric_desc += f'mIoU_pix = {metric_iou_pix}'
+        with open(ins_metrics_file, 'w') as f:
+            f.write(ins_metric_desc)
+
+
+
+    # plot_test(implicit_network, indices, plot_data, path, index, img_res, plot_nimgs, resolution, grid_boundary,
+    #           level=0, ins_map=None):
 
     def get_plot_data(self, model_outputs, pose, rgb_gt, seg_gt):
         batch_size, num_samples, _ = rgb_gt.shape
