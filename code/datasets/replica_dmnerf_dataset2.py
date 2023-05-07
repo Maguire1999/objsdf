@@ -37,6 +37,7 @@ class ReplicaDataset(torch.utils.data.Dataset):
         self.Ts_full = np.loadtxt(traj_file, delimiter=" ").reshape(-1, 4, 4)
 
         self.color_dict = self.load_color_dict()
+        self.set_label_colour_map("")
         self.meta = {}
         # with open(os.path.join(data_dir, "transforms_full.json"), 'r') as f:
         #     self.meta = json.load(f)
@@ -290,6 +291,7 @@ class ReplicaDataset(torch.utils.data.Dataset):
             return color_map
 
         self.label_color_map = label_color_map
+        self.ins_rgbs = ins_rgbs
 
 
 
