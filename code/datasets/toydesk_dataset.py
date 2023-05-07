@@ -176,7 +176,7 @@ class ToydeskDataset(torch.utils.data.Dataset):
         self.sampling_idx = sampling_idx
 
 if __name__ == '__main__':
-    a = ToydeskDataset('/home/monster/Projects/Nerf_experiment/data/toydesk_data/processed/our_desk_2', [640, 480])
+    a = ToydeskDataset('/data/dzy_data/nerf/datasets/toydesk_data/processed/our_desk_2', [640, 480])
     i_split = a.i_split
     print(i_split)
     # train_split = torch.utils.data.sampler.SubsetRandomSampler(i_split[0])
